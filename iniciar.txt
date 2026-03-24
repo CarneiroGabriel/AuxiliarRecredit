@@ -1,0 +1,2 @@
+py -m venv .venv
+streamlit run app_streamlit_recredit_integrado.py
