@@ -8,11 +8,12 @@ from typing import List
 import pandas as pd
 import streamlit as st
 
-from importador_core_patched import (
+from importador_core_final_v5 import (
     DEFAULT_CONFIG,
     ImportadorRecredit,
     aplicar_regra_unidade_txt,
     carregar_config_json,
+    aplicar_vencimento_txt,
 )
 
 st.set_page_config(page_title="Recredit - Importador + Cobrança", page_icon="🏢", layout="wide")
@@ -182,12 +183,19 @@ def classify_charge(entries: list[dict]) -> str:
 
 
 def normalize_unit(unit_raw: str) -> str:
-    unit = re.sub(r"\s+", " ", unit_raw.strip().upper())
+    unit = re.sub(r"\s+", " ", str(unit_raw).strip().upper())
     unit = unit.replace("CONDOMÍONIO", "CONDOMINIO")
     unit = unit.replace("CONDOMÍNIO", "CONDOMINIO")
     unit = unit.replace("CONDIMÍNIO", "CONDOMINIO")
-    unit = unit.replace("SL. ", "SL")
-    unit = unit.replace("SL ", "SL")
+    unit = unit.replace("SL. ", "SL ")
+    unit = unit.replace("SALA ", "SL ")
+    unit = re.sub(r"\s+", " ", unit).strip()
+
+    # mantém códigos colados e com sufixos, ex.: 00103, 101T2, 405T2, 0101C
+    if re.fullmatch(r"\d{5}", unit):
+        return unit
+    if re.fullmatch(r"\d{3,4}[A-Z]{0,2}\d{0,2}", unit):
+        return unit
 
     # 101 01 -> 01-101
     m = re.fullmatch(r"(\d{3,4})\s+(\d{2})", unit)
@@ -195,19 +203,22 @@ def normalize_unit(unit_raw: str) -> str:
         return f"{m.group(2)}-{m.group(1)}"
 
     # BL 1 102 -> BL 1 102
-    m = re.fullmatch(r"BL\s*(\d+)\s+(\d{3,4})", unit)
+    m = re.fullmatch(r"BL\s*(\d+)\s+(\d{3,4}[A-Z]{0,2}\d{0,2})", unit)
     if m:
         return f"BL {m.group(1)} {m.group(2)}"
 
     # sala variations
-    m = re.fullmatch(r"([A-Z0-9-]+)\s+SL\.?\s*(\d{1,3})", unit)
+    m = re.fullmatch(r"([A-Z0-9.-]+)\s+SL\s*(\d{1,3})", unit)
     if m:
         return f"{m.group(1)}-SL{int(m.group(2)):02d}"
+    m = re.fullmatch(r"SL\s*(\d{1,3})", unit)
+    if m:
+        return f"SL {int(m.group(1)):02d}"
 
     return unit
 
 
-UNIT_PATTERN = r"(?:BL\s*\d+\s+\d{3,4}|B\.[A-Z]-\d{3}|B\d+-SL\d{2}|B\d+-\d{3}|[A-Z]-\d{2,3}|\d{4}[A-Z]|\d{4}[A-Z]\b|\d{3,4}\s+\d{2}|SL\.?\s*\d{1,3}|\d{3,4})"
+UNIT_PATTERN = r"(?:BL\s*\d+\s+\d{3,4}[A-Z]{0,2}\d{0,2}|B\.[A-Z]-\d{3}|B\d+-SL\d{2}|B\d+-\d{3}|[A-Z]-\d{2,3}|\d{5}|\d{3,4}[A-Z]{0,2}\d{0,2}|\d{2}-\d{3}|\d{3,4}\s+\d{2}|SL\.?\s*\d{1,3}|SALA\s*\d{1,3})"
 ENTRY_RE = re.compile(
     rf"^(?:(?P<status>[A-Z])\s+)?(?P<unit>{UNIT_PATTERN})\s+"
     r"(?P<desc>.+?)\s+(?P<due>\d{2}/\d{2}/\d{4})\s+[-\d., ]+$",
@@ -444,11 +455,67 @@ def build_message(
 
 
 def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    from openpyxl.styles import Font
+
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="dados")
+        ws = writer.sheets["dados"]
+        headers = {cell.value: idx + 1 for idx, cell in enumerate(ws[1])}
+        link_col = headers.get("link_whatsapp")
+        if link_col:
+            for row in range(2, ws.max_row + 1):
+                cell = ws.cell(row=row, column=link_col)
+                link = cell.value
+                if link:
+                    cell.hyperlink = link
+                    cell.value = "Abrir WhatsApp"
+                    cell.style = "Hyperlink"
+                    cell.font = Font(color="0563C1", underline="single")
     return output.getvalue()
 
+
+def aplicar_regras_ignorar_link(
+    df: pd.DataFrame,
+    ignorar_vencimento_unico: str = "",
+    ignorar_multa_unica: bool = False,
+    ignorar_palavras_unico: str = "",
+) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    resultado = df.copy()
+    resultado["motivo_sem_link"] = resultado.get("motivo_sem_link", "")
+
+    palavras = [p.strip().lower() for p in (ignorar_palavras_unico or "").split(",") if p.strip()]
+
+    def _motivos(row) -> list[str]:
+        motivos = []
+        qtde = int(row.get("qtde_titulos", 0) or 0)
+        vencs = str(row.get("vencimentos_aberto", "") or "")
+        resumo = str(row.get("resumo_lancamentos", "") or "").strip()
+        resumo_lower = resumo.lower()
+
+        if ignorar_vencimento_unico and qtde == 1 and vencs.strip() == ignorar_vencimento_unico.strip():
+            motivos.append(f"único título em {ignorar_vencimento_unico.strip()}")
+
+        if ignorar_multa_unica and qtde == 1 and "multa" in resumo_lower:
+            motivos.append("multa única")
+
+        if palavras and qtde == 1 and any(palavra in resumo_lower for palavra in palavras):
+            motivos.append("palavra-chave em título único")
+
+        return motivos
+
+    for idx, row in resultado.iterrows():
+        motivos = _motivos(row)
+        if motivos:
+            resultado.at[idx, "link_whatsapp"] = ""
+            atual = str(resultado.at[idx, "motivo_sem_link"] or "").strip()
+            extra = " | ".join(motivos)
+            resultado.at[idx, "motivo_sem_link"] = f"{atual} | {extra}".strip(" |")
+
+    return resultado
 
 # =========================
 # Interface
@@ -483,6 +550,7 @@ with aba1:
             key="regra_importador",
         )
         codigo_orlando = st.text_input("Código alvo Orlando", value="101", key="orlando_importador")
+        novo_vencimento = st.text_input("Substituir vencimento (opcional)", value="", placeholder="dd/mm/aaaa", key="novo_vencimento_importador")
 
     with col2:
         st.caption("Cabeçalho do TXT")
@@ -507,6 +575,7 @@ with aba1:
             }
             core = ImportadorRecredit(config=config)
             boletos = core.parse_file(arquivo.read(), arquivo.name)
+            boletos = core.aplicar_vencimento(boletos, novo_vencimento)
 
             if not boletos:
                 st.warning("Nenhum boleto reconhecido.")
@@ -530,11 +599,13 @@ with aba2:
     txt_file = st.file_uploader("Envie o TXT", type=["txt"], key="arquivo_txt_regra")
     regra_txt = st.selectbox("Regra", options=["padrao", "portal", "mafalda", "orlando"], key="regra_txt")
     codigo_orlando_txt = st.text_input("Código alvo Orlando", value="101", key="orlando_txt")
+    novo_vencimento_txt = st.text_input("Substituir vencimento (opcional)", value="", placeholder="dd/mm/aaaa", key="novo_vencimento_txt")
 
     if txt_file is not None:
         try:
             conteudo = txt_file.read().decode("cp1252", errors="ignore")
             convertido = aplicar_regra_unidade_txt(conteudo, regra_txt, codigo_orlando_txt)
+            convertido = aplicar_vencimento_txt(convertido, novo_vencimento_txt)
             st.download_button(
                 "Baixar TXT corrigido",
                 data=txt_para_download_bytes(convertido),
@@ -547,31 +618,49 @@ with aba2:
 
 with aba3:
     st.subheader("Cobrança WhatsApp")
-    st.caption("Suporta unidades como 0101, 01-101, 101 01, BL 1 102, B1-104, B.A-103, 0101C, A-12, B2-SL04 e similares.")
+    st.caption("Suporta unidades como 0101, 01-101, 101 01, BL 1 102, B1-104, B.A-103, 0101C, A-12, B2-SL04, 00103, 101T2 e similares.")
 
     col_a, col_b = st.columns([1, 1])
     with col_a:
         pdf_inad = st.file_uploader("PDF de inadimplência", type=["pdf"], key="pdf_inad")
+        st.markdown("**Regras para não gerar link**")
+        ignorar_vencimento_unico = st.text_input(
+            "Ignorar se houver somente 1 título com este vencimento",
+            value="",
+            placeholder="dd/mm/aaaa",
+            key="ignorar_vencimento_unico",
+        )
+        ignorar_multa_unica = st.checkbox(
+            "Ignorar se houver somente 1 lançamento e ele for multa",
+            value=False,
+            key="ignorar_multa_unica",
+        )
+        ignorar_palavras_unico = st.text_input(
+            "Ignorar se o único lançamento contiver estas palavras",
+            value="",
+            placeholder="ex.: multa, honorarios, custas",
+            key="ignorar_palavras_unico",
+        )
 
     with col_b:
         msg_amistosa = st.text_area(
             "Mensagem amistosa",
-            value="Olá, {primeiro_nome}. Identificamos pendências da unidade {unidade} no {condominio}, com vencimento(s) em {vencimentos}. Podemos te ajudar na regularização.",
+            value="Olá, {primeiro_nome}. Identificamos em {condominio} pendências da unidade {unidade}, com vencimento(s) em {vencimentos}. Podemos te ajudar na regularização.",
             height=110,
         )
         msg_acordo = st.text_area(
             "Mensagem acordo",
-            value="Olá, {primeiro_nome}. Constam pendência relacionada ao unidade {unidade} no {condominio}, com vencimento(s) em {vencimentos}. Pedimos retorno para regularização.",
+            value="Olá, {primeiro_nome}. Consta em {condominio} pendência relacionada ao acordo/unidade {unidade}, com vencimento(s) em {vencimentos}. Pedimos retorno para regularização.",
             height=110,
         )
         msg_juridica = st.text_area(
             "Mensagem jurídica",
-            value="Olá, {primeiro_nome}. A unidade {unidade} de {condominio} possui pendência(s) em aberto, com vencimento(s) em {vencimentos}. \n\n Esta unidade possui apontamento em cobrança jurídica. Solicitamos contato para tratativa.",
+            value="Olá, {primeiro_nome}. A unidade {unidade} de {condominio} possui pendência(s) em aberto, com vencimento(s) em {vencimentos}. Solicitamos contato para tratativa.",
             height=110,
         )
         msg_execucao = st.text_area(
             "Mensagem execução",
-            value="Olá, {primeiro_nome}. A unidade {unidade} de {condominio} possui débito em execução. Vencimento(s): {vencimentos}.",
+            value="Olá, {primeiro_nome}. A unidade {unidade} de {condominio} possui débito em execução. Vencimento(s): {vencimentos}. Valor atualizado aproximado: R$ {valor_total}.",
             height=110,
         )
 
@@ -581,7 +670,16 @@ with aba3:
             if df.empty:
                 st.warning("Nenhuma unidade reconhecida neste PDF.")
             else:
+                df = aplicar_regras_ignorar_link(
+                    df,
+                    ignorar_vencimento_unico=ignorar_vencimento_unico,
+                    ignorar_multa_unica=ignorar_multa_unica,
+                    ignorar_palavras_unico=ignorar_palavras_unico,
+                )
+                sem_link = int((df["link_whatsapp"].fillna("") == "").sum())
                 st.success(f"{len(df)} unidades reconhecidas.")
+                if sem_link:
+                    st.info(f"{sem_link} unidade(s) ficaram sem link por regra ou por falta de telefone/status.")
                 st.dataframe(df, use_container_width=True)
                 st.download_button(
                     "Baixar Excel",
