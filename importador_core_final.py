@@ -32,7 +32,7 @@ DEFAULT_CONFIG = {
 }
 
 
-DATA_ROW_RE = re.compile(r"^\s*(SALA\s+\d+|SL\.\s*\d+|\d+[A-Z]?)\s+(\d{2}/\d{2}/\d{4})\s+(.+)$", re.I)
+DATA_ROW_RE = re.compile(r"^\s*((?:SALA|SL\.?)\s*\d+|\d+[A-Z]?)\s+(\d{2}/\d{2}/\d{4})\s+(.+)$", re.I)
 MONEY_RE = re.compile(r"-?\d[\d\.]*,\d{2}|-")
 TXT_UNI_RE = re.compile(r"^(UNI_CODIGO=)(.*)$", re.M)
 
@@ -173,16 +173,25 @@ class ImportadorRecredit:
                 "simulacao das arrecadacoes", "unidade/bloco", "cobrancas", "administradora", "@tjcondominios",
             ]):
                 continue
-            if re.search(r"\b\d+ de \d+\b", norm):
+            if re.search(r"\b\d+ de \d+\b", norm) or "****" in line:
                 continue
+
             m = DATA_ROW_RE.match(line)
             if not m:
                 continue
+
             unidade, venc, resto = m.groups()
             valores = MONEY_RE.findall(resto)
-            boleto = boletos.setdefault(unidade.upper().replace("  ", " "), Boleto(unidade=unidade.upper().replace("  ", " "), vencimento=venc))
+            unidade_fmt = re.sub(r'\s+', ' ', unidade.upper().replace('SL.', 'SL')).strip()
+            unidade_fmt = re.sub(r'^SALA\s+', 'SL ', unidade_fmt)
+            m_sl = re.match(r'^SL\s*(\d{1,2})$', unidade_fmt)
+            if m_sl:
+                unidade_fmt = f"SL {int(m_sl.group(1)):02d}" 
+            boleto = boletos.setdefault(unidade_fmt, Boleto(unidade=unidade_fmt, vencimento=venc))
 
-            if len(valores) == 4:
+            if len(valores) == 2:
+                boleto.add_rateio("0009", "Chamada de Capital", self._to_money(valores[0]))
+            elif len(valores) == 4:
                 labels = [
                     ("0002", "Fundo de Reserva"),
                     ("0001", "Taxa Condominial"),
@@ -190,8 +199,25 @@ class ImportadorRecredit:
                 ]
                 for (cod, hist), valor in zip(labels, valores[:-1]):
                     boleto.add_rateio(cod, hist, self._to_money(valor))
-            elif len(valores) == 2:
-                boleto.add_rateio("0009", "Chamada de Capital", self._to_money(valores[0]))
+            elif len(valores) == 5:
+                labels = [
+                    ("0002", "Fundo de Reserva"),
+                    ("0009", "Chamada de Capital"),
+                    ("0001", "Taxa Condominial"),
+                    ("0022", "Locação de Garagem"),
+                ]
+                for (cod, hist), valor in zip(labels, valores[:-1]):
+                    boleto.add_rateio(cod, hist, self._to_money(valor))
+            elif len(valores) == 6:
+                labels = [
+                    ("0003", "Consumo de Gás"),
+                    ("0004", "Consumo de Água"),
+                    ("0001", "Taxa Condominial"),
+                    ("0002", "Fundo de Reserva"),
+                    ("0009", "Chamada de Capital"),
+                ]
+                for (cod, hist), valor in zip(labels, valores[:-1]):
+                    boleto.add_rateio(cod, hist, self._to_money(valor))
             elif len(valores) == 7:
                 labels = [
                     ("0004", "Consumo de Água"),
@@ -250,9 +276,9 @@ class ImportadorRecredit:
                 continue
             if unidade_base.lower().startswith("sala"):
                 sala_num = re.search(r"(\d+)", unidade_base).group(1).zfill(2)
-                unidade = f"SL{sala_num}{bloco}"
+                unidade = f"SALA {sala_num} {bloco}"
             else:
-                unidade = f"{unidade_base}{bloco}"
+                unidade = f"{unidade_base} {bloco}"
             boleto = Boleto(unidade=unidade.upper(), vencimento=venc)
             labels = [
                 ("0001", "Taxas de condomínio"),
@@ -320,8 +346,68 @@ class ImportadorRecredit:
         return boletos
 
     def _parse_pdf_almah(self, text: str) -> list[Boleto]:
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        lines = [" ".join(ln.strip().split()) for ln in text.splitlines() if ln.strip()]
         boletos: list[Boleto] = []
+
+        # Layouts Almah variam bastante. Alguns saem em blocos verticais; outros
+        # vêm linha a linha, como: UNICO 101 15/04/2026 224,33 22,43 12,74 260,00 519,50 519,50
+        # Esta função tenta primeiro o formato horizontal e, se não achar nada,
+        # cai para o formato vertical antigo.
+        for line in lines:
+            norm = self._norm(line)
+            if (
+                not line
+                or norm.startswith("bloco unidade")
+                or norm.startswith("total total")
+                or "registro(s) encontrado" in norm
+                or norm.startswith("composicao das arrecadacoes")
+            ):
+                continue
+
+            m = re.match(
+                r"^(?P<bloco>[A-Z0-9.-]+)\s+(?P<unidade>(?:SLA?\.?\s*\d{1,2}|SALA\s*\d{1,2}|\d{2,4}[A-Z]?))\s+"
+                r"(?P<venc>\d{2}/\d{2}/\d{4})\s+(?P<resto>.+)$",
+                line,
+                flags=re.I,
+            )
+            if not m:
+                continue
+
+            bloco = m.group("bloco").upper()
+            unidade = m.group("unidade").upper().replace("SLA", "SL").replace("SALA", "SL")
+            unidade = re.sub(r"\s+", " ", unidade).replace("SL.", "SL")
+            unidade = f"{unidade} {bloco}" if bloco not in {"UNICO", "ÚNICO"} else unidade
+            venc = m.group("venc")
+            resto = m.group("resto")
+            valores = re.findall(r"\(?-?\d[\d\.]*,\d{2}\)?|-", resto)
+
+            # Total é sempre a última ou as duas últimas colunas; pegamos as rubricas antes do total.
+            if len(valores) >= 5:
+                data_vals = valores[:-2] if len(valores) >= 6 else valores[:-1]
+                boleto = Boleto(unidade=unidade, vencimento=venc)
+
+                # Mapeamentos conhecidos dos layouts Almah já enviados.
+                labels = [
+                    ("0001", "Cota Condominial"),
+                    ("0002", "Fundo de Reserva"),
+                    ("0003", "Gas"),
+                    ("0009", "Chamada de Capital"),
+                    ("0004", "Agua"),
+                    ("0022", "Produtos"),
+                    ("0009", "Chamada de Capital 07/36"),
+                    ("0009", "Chamada de Capital 06/36"),
+                    ("0022", "Tarifas"),
+                    ("0022", "Outros"),
+                ]
+                for (cod, hist), valor in zip(labels, data_vals):
+                    boleto.add_rateio(cod, hist, self._to_money(valor))
+                if boleto.rateios:
+                    boletos.append(boleto)
+
+        if boletos:
+            return boletos
+
+        # Fallback: formato vertical antigo.
         i = 0
         while i < len(lines):
             if lines[i].upper() in {"ÚNICO", "UNICO"}:
@@ -408,6 +494,18 @@ class ImportadorRecredit:
             return self.parse_excel(file_bytes, filename)
         raise ValueError("Formato não suportado")
 
+    def aplicar_vencimento(self, boletos: Iterable[Boleto], novo_vencimento: str | None) -> list[Boleto]:
+        boletos = list(boletos)
+        if not novo_vencimento:
+            return boletos
+        novo_vencimento = str(novo_vencimento).strip()
+        if not re.fullmatch(r"\d{2}/\d{2}/\d{4}", novo_vencimento):
+            raise ValueError("O novo vencimento deve estar no formato dd/mm/aaaa")
+        for boleto in boletos:
+            boleto.vencimento = novo_vencimento
+        return boletos
+
+
     def gerar_txt(self, boletos: Iterable[Boleto], regra_unidade: str = "padrao") -> str:
         boletos = list(boletos)
         hoje = datetime.now()
@@ -457,10 +555,15 @@ def carregar_config_json(file_bytes: bytes | None) -> dict:
 
 
 def regra_portal_uni(valor: str) -> str:
-    m = re.match(r"^(\d+)\s+(\d+)$", valor.strip())
+    valor = re.sub(r"\s+", " ", valor.strip())
+    m = re.match(r"^(\d+)\s+(\d+)$", valor)
     if m:
         unidade, bloco = m.groups()
         return f"B{int(bloco)}-{unidade}"
+    m = re.match(r"^(?:SALA|SL)\s*(\d+)\s+(\d+)$", valor, flags=re.I)
+    if m:
+        sala, bloco = m.groups()
+        return f"B{int(bloco)}-SL{int(sala):02d}"
     return valor
 
 
@@ -495,3 +598,12 @@ def aplicar_regra_unidade_txt(texto: str, regra: str, codigo_alvo_orlando: str =
     if regra == "orlando":
         return regra_orlando_txt(texto, codigo_alvo_orlando)
     return texto
+
+
+def aplicar_vencimento_txt(texto: str, novo_vencimento: str | None) -> str:
+    if not novo_vencimento:
+        return texto
+    novo_vencimento = str(novo_vencimento).strip()
+    if not re.fullmatch(r"\d{2}/\d{2}/\d{4}", novo_vencimento):
+        raise ValueError("O novo vencimento deve estar no formato dd/mm/aaaa")
+    return re.sub(r"^(BLQ_DATVEN=).*$", rf"\1{novo_vencimento}", texto, flags=re.M)

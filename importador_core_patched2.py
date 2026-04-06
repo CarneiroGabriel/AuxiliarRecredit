@@ -22,12 +22,12 @@ DEFAULT_CONFIG = {
     "encoding_saida": "cp1252",
     "historico_padrao": "Taxa Condominial",
     "aliases_taxas": {
-        "0001": ["taxa condominial", "taxa de condominio", "cota condominial", "cotas condominiais", "taxas de condominio", "despesas"],
+        "0001": ["taxa condominial", "taxa de condominio", "cota condominial", "despesas"],
         "0002": ["fundo de reserva", "fundo de\nreserva", "fundo reserva"],
         "0003": ["gas", "consumo de gas", "gás"],
-        "0004": ["agua", "água", "consumo de agua", "receita com agua", "excedente de agua"],
-        "0009": ["chamada de capital", "chamadas de capital", "capital parc", "capital"],
-        "0022": ["produtos", "tarifas", "outros", "salao de festas", "salão de festas", "fundo de obras"],
+        "0004": ["agua", "água", "consumo de agua", "receita com agua"],
+        "0009": ["chamada de capital", "capital parc", "capital"],
+        "0022": ["produtos", "tarifas", "outros", "salao de festas", "salão de festas"],
     },
 }
 
@@ -51,8 +51,8 @@ class Boleto:
     historico: str = "Taxa Condominial"
     rateios: list[Rateio] = field(default_factory=list)
 
-    def add_rateio(self, codigo: str, historico: str, valor: float | None):
-        if valor is None or abs(valor) < 1e-9:
+    def add_rateio(self, codigo: str, historico: str, valor: float):
+        if valor is None or valor <= 0:
             return
         self.rateios.append(Rateio(codigo=codigo, historico=historico, valor=round(float(valor), 2)))
 
@@ -94,7 +94,7 @@ class ImportadorRecredit:
         if isinstance(value, (int, float)):
             return round(float(value), 2)
         s = str(value).strip()
-        if not s or s == "-" or s.lower() in {"nan", "nat", "none"}:
+        if not s or s == "-" or s.lower() == "nan":
             return 0.0
         s = s.replace("R$", "").replace(" ", "")
         if "," in s:
@@ -116,11 +116,12 @@ class ImportadorRecredit:
                     return codigo
         return "0022"
 
+
     def _extract_pdf_text(self, file_bytes: bytes) -> str:
         erros: list[str] = []
 
         try:
-            from pypdf import PdfReader
+            from pypdf import PdfReader  # lazy import
             reader = PdfReader(BytesIO(file_bytes))
             pages = [(p.extract_text() or "") for p in reader.pages]
             texto = "\n\n".join(pages).strip()
@@ -130,7 +131,7 @@ class ImportadorRecredit:
             erros.append(f"pypdf: {e}")
 
         try:
-            import pdfplumber
+            import pdfplumber  # lazy import
             with pdfplumber.open(BytesIO(file_bytes)) as pdf:
                 pages = [(page.extract_text() or "") for page in pdf.pages]
             texto = "\n\n".join(pages).strip()
@@ -150,16 +151,14 @@ class ImportadorRecredit:
         full_text = self._extract_pdf_text(file_bytes)
         n = self._norm(full_text)
 
-        if "index administradora" in n and "fundo de obras" in n and "cotas condominiais" in n:
-            return self._parse_pdf_index(full_text)
-        if "adf administradora" in n and "taxas de condominio" in n and "excedente de agua" in n:
-            return self._parse_pdf_adf_portal(full_text)
         if "almahcondos" in n or "residencial santa marcelina" in n or "composicao das arrecadacoes" in n:
             return self._parse_pdf_almah(full_text)
         if "simulacao das arrecadacoes" in n:
             return self._parse_pdf_jlm(full_text)
         if "composicao de cota condominial" in n:
             return self._parse_pdf_excel_consultoria(full_text)
+        if "previa de cota condominial" in n or "prévia de cota condominial" in n:
+            return self._parse_pdf_previa_cota(full_text)
         return []
 
     def _parse_pdf_jlm(self, text: str) -> list[Boleto]:
@@ -204,69 +203,6 @@ class ImportadorRecredit:
                 for (cod, hist), valor in zip(labels, valores[:-1]):
                     boleto.add_rateio(cod, hist, self._to_money(valor))
         return list(boletos.values())
-
-    def _parse_pdf_index(self, text: str) -> list[Boleto]:
-        boletos: list[Boleto] = []
-        row_re = re.compile(r"^(\d{4})\s+([A-Z])\s+(\d{2}/\d{2}/\d{4})\s+(.+)$")
-        for raw in text.splitlines():
-            line = raw.strip()
-            if not line:
-                continue
-            m = row_re.match(line)
-            if not m:
-                continue
-            apto, bloco, venc, resto = m.groups()
-            valores = MONEY_RE.findall(resto)
-            if len(valores) != 5:
-                continue
-            boleto = Boleto(unidade=f"{apto}{bloco}", vencimento=venc)
-            labels = [
-                ("0002", "Fundo de Reserva"),
-                ("0001", "Cotas Condominiais"),
-                ("0022", "Fundo de Obras"),
-                ("0009", "Chamada de Capital"),
-            ]
-            for (cod, hist), valor in zip(labels, valores[:-1]):
-                boleto.add_rateio(cod, hist, self._to_money(valor))
-            if boleto.rateios:
-                boletos.append(boleto)
-        return boletos
-
-    def _parse_pdf_adf_portal(self, text: str) -> list[Boleto]:
-        boletos: list[Boleto] = []
-        row_re = re.compile(r"^(Sala\s+\d{1,2}|\d{3})\s+(\d{2})\s+(\d{2}/\d{2}/\d{4})\s+(.+)$", re.I)
-        for raw in text.splitlines():
-            line = raw.strip()
-            if not line:
-                continue
-            if any(x in self._norm(line) for x in ["simulacao das arrecadacoes", "taxas de condominio", "adf administradora", "cobrancas", "boletos1@adfadm.com.br"]):
-                continue
-            m = row_re.match(line)
-            if not m:
-                continue
-            unidade_base, bloco, venc, resto = m.groups()
-            valores = MONEY_RE.findall(resto)
-            if len(valores) != 7:
-                continue
-            if unidade_base.lower().startswith("sala"):
-                sala_num = re.search(r"(\d+)", unidade_base).group(1).zfill(2)
-                unidade = f"SL{sala_num}{bloco}"
-            else:
-                unidade = f"{unidade_base}{bloco}"
-            boleto = Boleto(unidade=unidade.upper(), vencimento=venc)
-            labels = [
-                ("0001", "Taxas de condomínio"),
-                ("0002", "Fundo de reserva"),
-                ("0009", "Chamada de Capital 3"),
-                ("0009", "Chamadas de capital"),
-                ("0004", "Excedente de água"),
-                ("0022", "Outros"),
-            ]
-            for (cod, hist), valor in zip(labels, valores[:-1]):
-                boleto.add_rateio(cod, hist, self._to_money(valor))
-            if boleto.rateios:
-                boletos.append(boleto)
-        return boletos
 
     def _extract_unit_before_date(self, prefix: str) -> str | None:
         m = re.search(r"(SL\.\s*\d+|SALA\s+\d+|\d+[A-Z]?)\s*$", prefix, flags=re.I)
@@ -319,12 +255,66 @@ class ImportadorRecredit:
             boletos.append(boleto)
         return boletos
 
+
+    def _parse_pdf_previa_cota(self, text: str) -> list[Boleto]:
+        boletos: list[Boleto] = []
+        for raw in text.splitlines():
+            line = re.sub(r"\s+", " ", raw).strip()
+            if not line:
+                continue
+            n = self._norm(line)
+            if any(x in n for x in [
+                "previa de cota condominial", "mes/ano:", "bloco:", "und. vencimento",
+                "titulos", "títulos", "patrimony", "praiano", "receita com gas",
+                "tarifa agua", "chamada de capital", "cobranca garantida", "cobrança garantida",
+            ]):
+                continue
+            if re.match(r"^\d+[\.,]\d{2}$", line):
+                continue
+            m = re.match(r"^(\d+[A-Z]?|SL\.\s*\d+|SALA\s+\d+)\s+(\d{2}/\d{2}/\d{4})\s+(.+)$", line, flags=re.I)
+            if not m:
+                continue
+            unidade, venc, resto = m.groups()
+            valores = MONEY_RE.findall(resto)
+            if len(valores) < 7:
+                continue
+            # Último valor é sempre Total; os 6 primeiros são fixos e os 3 últimos são opcionais
+            pre_total = valores[:-1]
+            labels_fixos = [
+                ("0001", "Despesas"),
+                ("0004", "Rateio Tarifa Água"),
+                ("0009", "Chamada de Capital 32/36"),
+                ("0022", "Cobrança Garantida"),
+                ("0022", "Cotas de Capital"),
+                ("0002", "Fundo de Reserva"),
+            ]
+            labels_opcionais = [
+                ("0003", "Gás"),
+                ("0022", "Receita com Gás (Desconto)"),
+                ("0022", "Multa por Infração Regimental"),
+            ]
+            if len(pre_total) < len(labels_fixos):
+                continue
+            boleto = Boleto(unidade=unidade.upper().replace("  ", " "), vencimento=venc)
+            for (cod, hist), valor in zip(labels_fixos, pre_total[:len(labels_fixos)]):
+                boleto.add_rateio(cod, hist, self._to_money(valor))
+            extras = pre_total[len(labels_fixos):]
+            for (cod, hist), valor in zip(labels_opcionais, extras):
+                money = self._to_money(valor)
+                if money is None:
+                    continue
+                # Mantém descontos negativos se vierem no PDF
+                boleto.rateios.append(Rateio(codigo=cod, historico=hist, valor=round(float(money), 2)))
+            if boleto.rateios:
+                boletos.append(boleto)
+        return boletos
+
     def _parse_pdf_almah(self, text: str) -> list[Boleto]:
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         boletos: list[Boleto] = []
         i = 0
         while i < len(lines):
-            if lines[i].upper() in {"ÚNICO", "UNICO"}:
+            if lines[i].upper() == "ÚNICO" or lines[i].upper() == "UNICO":
                 block = []
                 j = i + 1
                 while j < len(lines):
@@ -372,19 +362,22 @@ class ImportadorRecredit:
         boletos = []
         for _, row in df.iterrows():
             unidade = str(row.iloc[unidade_idx]).strip()
-            if not unidade or unidade.lower() == "nan":
+            if not unidade or unidade.lower() in {"nan", "nat"}:
                 continue
             venc_raw = row.iloc[venc_idx]
             if pd.isna(venc_raw):
                 continue
-            if hasattr(venc_raw, "strftime"):
-                venc = venc_raw.strftime("%d/%m/%Y")
-            else:
-                try:
-                    venc_dt = pd.to_datetime(venc_raw, errors="raise")
-                    venc = venc_dt.strftime("%d/%m/%Y")
-                except Exception:
-                    venc = str(venc_raw).strip()
+            venc = None
+            try:
+                ts = pd.to_datetime(venc_raw, errors="coerce")
+                if pd.notna(ts):
+                    venc = ts.strftime("%d/%m/%Y")
+            except Exception:
+                venc = None
+            if not venc:
+                venc = str(venc_raw).strip()
+                if not venc or venc.lower() in {"nan", "nat"}:
+                    continue
             boleto = Boleto(unidade=unidade, vencimento=venc)
             for idx, col in enumerate(df.columns):
                 if idx in {unidade_idx, venc_idx}:
